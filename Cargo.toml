@@ -1,0 +1,19 @@
+[package]
+name = "gpio-sensors"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+time = "0.3.41"
+# Raspberry PiのGPIOやその他のペリフェラルを制御するためのライブラリ
+rppal = "0.22.1"
+rasp_party = { path = "../rasp_party" }
+tokio = { version = "1", features = ["full", "macros", "rt-multi-thread"] }
+futures = "0.3"
+actix-web = "4.11.0"
+bmi160 = "1.1.0"
+linux-embedded-hal = "0.4.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+anyhow = "1.0.98"
+crossbeam-channel = "0.5.15"

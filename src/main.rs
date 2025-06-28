@@ -1,3 +1,5 @@
+// --- ライブラリのインポート ---
+// 非同期処理、Webフレームワーク、スレッド間通信、シリアライズなど、必要な機能を読み込みます。
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -5,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use anyhow::Result;
-use rasp_party::GpioPin;
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::task::{self, JoinHandle};
@@ -14,17 +15,22 @@ use rppal::gpio::{Event, Gpio, Level};
 use bmi160::{Bmi160, SlaveAddr, SensorSelector, AccelerometerPowerMode, GyroscopePowerMode};
 use linux_embedded_hal::I2cdev;
 
-// rasp_gpioモジュールをインポート
+// 自作ライブラリ(クレート) `rasp_party` からモジュールとトレイトをインポートします。
 use rasp_party::rasp_gpio::{RaspGpio, GPIO};
+use rasp_party::GpioPin;
 
-// --- ADDED: センサーの使用を制御する設定フラグ ---
+
+// --- グローバルな設定とデータ構造の定義 ---
+
+/// どのセンサーを使用するかを制御するための設定フラグ。
+/// main関数の開始地点でこの値を変更するだけで、動作を簡単に切り替えられます。
 #[derive(Debug, Clone, Copy)]
 struct SensorConfig {
     use_ultrasonic: bool,
     use_imu: bool,
 }
 
-// --- データ構造の定義 (AppSensorData に名前を統一) ---
+/// 全てのセンサーデータを集約し、JSONで外部に提供するためのデータ構造。
 #[derive(Debug, Clone, Serialize)]
 struct AppSensorData {
     distance_cm: f64,
@@ -37,10 +43,11 @@ struct AppSensorData {
     timestamp: u64,
 }
 
+/// センサーデータ構造体の初期値を定義します。
 impl Default for AppSensorData {
     fn default() -> Self {
         Self {
-            distance_cm: -1.0, // 未使用時は-1.0
+            distance_cm: -1.0, // データがないことを示すために-1.0を初期値とします。
             acceleration_x: 0.0,
             acceleration_y: 0.0,
             acceleration_z: 0.0,
@@ -52,45 +59,48 @@ impl Default for AppSensorData {
     }
 }
 
-// --- センサー制御ロジック (変更なし) ---
+// --- センサー制御ロジック ---
+
+/// 超音波センサー(HY-SRF05)の距離を測定する純粋なロジック。
 fn measure_distance(gpio: &Gpio, trig_pin: u8, echo_pin: u8) -> Result<f64> {
+    // Trigピンから短いパルスを送信
     let mut trigger = gpio.get(trig_pin)?.into_output();
     let echo = gpio.get(echo_pin)?.into_input();
-
     trigger.set_low();
     thread::sleep(Duration::from_micros(5));
     trigger.set_high();
     thread::sleep(Duration::from_micros(10));
     trigger.set_low();
 
+    // Echoピンからの応答パルスの長さを計測
     let wait_start = Instant::now();
     while echo.read() == Level::Low {
         if wait_start.elapsed() > Duration::from_millis(500) {
             return Err(anyhow::anyhow!("HY-SRF05: Echo timed out waiting for start"));
         }
     }
-
     let pulse_start = Instant::now();
     while echo.read() == Level::High {
         if pulse_start.elapsed() > Duration::from_millis(500) {
             return Err(anyhow::anyhow!("HY-SRF05: Echo timed out waiting for end"));
         }
     }
-
     let pulse_duration = pulse_start.elapsed();
+
+    // パルスの長さと音速から距離を計算 (cm)
     let distance = (pulse_duration.as_secs_f64() * 34300.0) / 2.0;
     Ok(distance)
 }
 
-/// センサー読み取りループを実行する関数
-// CHANGED: SensorConfigを引数に追加
+/// 実際にセンサー群からデータを読み取り続けるループ処理。
+/// この関数は同期的(ブロッキング)な処理であるため、`tokio::task::spawn_blocking`で実行されます。
 fn run_sensor_loop(
     sensor_data_arc: Arc<Mutex<AppSensorData>>,
     running_arc: Arc<AtomicBool>,
     config: SensorConfig,
 ) {
     // --- センサーの遅延初期化 ---
-    // 各センサーは使用する場合のみ初期化される
+    // `SensorConfig`に基づき、使用するセンサーのみを初期化します。
     let gpio = if config.use_ultrasonic {
         Some(Gpio::new().expect("Failed to initialize GPIO"))
     } else {
@@ -100,23 +110,23 @@ fn run_sensor_loop(
     let mut bmi160 = if config.use_imu {
         let i2c_dev = I2cdev::new("/dev/i2c-1").expect("Failed to initialize I2C");
         let mut sensor = Bmi160::new_with_i2c(i2c_dev, SlaveAddr::default());
-        sensor.set_accel_power_mode(AccelerometerPowerMode::Normal)
-              .expect("Failed to set accelerometer power mode");
-        sensor.set_gyro_power_mode(GyroscopePowerMode::Normal)
-              .expect("Failed to set gyroscope power mode");
-        thread::sleep(Duration::from_millis(100));
+        sensor.set_accel_power_mode(AccelerometerPowerMode::Normal).expect("Failed to set accel power");
+        sensor.set_gyro_power_mode(GyroscopePowerMode::Normal).expect("Failed to set gyro power");
+        thread::sleep(Duration::from_millis(100)); // センサーの起動を待機
         Some(sensor)
     } else {
         None
     };
 
     println!("[Sensor Thread] Thread started. Reading sensors with config: {:?}", config);
+    // `running_arc`フラグがtrueである限り、ループを続けます。
     while running_arc.load(Ordering::Relaxed) {
         let mut current_data = AppSensorData::default();
 
-        // --- CHANGED: フラグに基づいて条件付きでセンサーを読み取る ---
+        // --- フラグに基づいて条件付きでセンサーを読み取る ---
         if config.use_ultrasonic {
             if let Some(ref gpio_instance) = gpio {
+                // `as_u8()`は自作の`GpioPin`トレイトから来ています。
                 if let Ok(dist) = measure_distance(gpio_instance, GPIO::P7_4.as_u8(), GPIO::P11_17.as_u8()) {
                     current_data.distance_cm = dist;
                     println!("距離:{:?}cm", dist);
@@ -143,46 +153,53 @@ fn run_sensor_loop(
         }
         
         current_data.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        // `Mutex`で保護された共有データに最新の値を書き込みます。
         *sensor_data_arc.lock().unwrap() = current_data;
-        thread::sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_millis(1000)); // 1秒ごとに処理
     }
     println!("[Sensor Thread] Thread finished.");
 }
 
 
-// --- Webサーバー ---
+// --- Webサーバー関連 ---
+
+/// Webブラウザ等からのリクエストに応じて、最新のセンサーデータをJSONで返すハンドラ。
 async fn get_sensors(data: web::Data<Arc<Mutex<AppSensorData>>>) -> impl Responder {
     let data_lock = data.lock().unwrap();
     HttpResponse::Ok().json(&*data_lock)
 }
 
-// --- スレッド管理タスクへのコマンド ---
+// --- アプリケーションのメインロジック ---
+
+/// センサー管理タスクに送るコマンドを定義。
 #[derive(Debug)]
 enum SensorCommand {
     Start,
     Stop,
 }
 
+/// 非同期ランタイムのエントリーポイント。
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // --- ADDED: ここでどのセンサーを使うか設定します ---
+    // 1. 設定の初期化
     let sensor_config = SensorConfig {
-        use_ultrasonic: true, // 超音波センサーを使うか
-        use_imu: false,        // 6軸IMUを使うか
+        use_ultrasonic: true, // trueにすると超音波センサーを使用
+        use_imu: false,       // trueにすると6軸IMUを使用
     };
     
     println!("Starting Sensor Demon with config: {:?}", sensor_config);
     println!("Please press the tact switch to start/stop sensor reading.");
 
-    // --- 共有データの準備 ---
+    // 2. 共有リソースの準備
+    // 全タスクで共有するデータ領域。`Arc<Mutex<...>>`はスレッドセーフな共有の定石。
     let sensor_data = Arc::new(Mutex::new(AppSensorData::default()));
-
-    // --- スレッド管理のためのメッセージチャネルを作成 ---
+    // タスク間でコマンドをやり取りするための非同期チャネル。
     let (tx, mut rx) = mpsc::channel::<SensorCommand>(32);
 
+    // 3. スレッド管理タスクの起動
+    // HTTPサーバーやスイッチ監視とは独立した、バックグラウンドで動作するタスク。
+    // センサー読み取りスレッドの起動・停止に全ての責任を持つ。
     let sensor_data_for_manager = sensor_data.clone();
-    
-    // --- スレッド管理を専門に行うタスクを起動 ---
     let manager_task_handle = tokio::spawn(async move {
         let mut sensor_thread_handle: Option<JoinHandle<()>> = None;
         let running_flag = Arc::new(AtomicBool::new(false));
@@ -194,11 +211,8 @@ async fn main() -> std::io::Result<()> {
                     if sensor_thread_handle.is_none() {
                         println!("[Manager Task] Received Start command. Starting thread...");
                         running_flag.store(true, Ordering::SeqCst);
-                        
                         let data_clone = sensor_data_for_manager.clone();
                         let running_clone = running_flag.clone();
-                        
-                        // CHANGED: センサー設定をスレッドに渡す
                         let handle = task::spawn_blocking(move || {
                             run_sensor_loop(data_clone, running_clone, sensor_config);
                         });
@@ -220,10 +234,11 @@ async fn main() -> std::io::Result<()> {
         }
     });
 
-    // --- タクトスイッチのセットアップ ---
+    // 4. タクトスイッチ監視のセットアップと開始
     let gpio = Gpio::new().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     let handle = tokio::runtime::Handle::current();
     
+    // スイッチが押されたら、コマンドをチャネル(`tx`)経由で管理タスクに送信するだけ。
     let mut switch_gpio = RaspGpio::create(GPIO::P38_20, gpio, {
         let tx_clone = tx.clone();
         move |switch_state: bool, _level: Event| {
@@ -237,10 +252,9 @@ async fn main() -> std::io::Result<()> {
             }
         }
     }).await.unwrap();
-
     switch_gpio.watch(handle).await.unwrap();
     
-    // --- HTTPサーバーの起動 ---
+    // 5. HTTPサーバーの起動
     println!("Starting HTTP server at http://0.0.0.0:9090");
     let server = HttpServer::new(move || {
         App::new()
@@ -250,14 +264,14 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", 9090))?
     .run();
 
-    server.await?;
+    // 6. 優雅なシャットダウン (Graceful Shutdown)
+    server.await?; // Ctrl+Cなどでサーバーが停止するまで待機
     
-    // --- クリーンアップ処理 ---
-    println!("Server stopped. Cleaning up resources...");
-    switch_gpio.unwatch().await.unwrap();
-    let _ = tx.send(SensorCommand::Stop).await;
-    manager_task_handle.await.expect("Manager task failed to shutdown");
+    println!("[main] Server stopped. Cleaning up resources...");
+    switch_gpio.unwatch().await.unwrap(); // スイッチ監視を停止
+    let _ = tx.send(SensorCommand::Stop).await; // 念のため停止コマンドを送信
+    manager_task_handle.await.expect("Manager task failed to shutdown"); // 管理タスクの完全終了を待つ
     
-    println!("Application finished gracefully.");
+    println!("[main] Application finished gracefully.");
     Ok(())
 }

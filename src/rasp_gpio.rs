@@ -4,7 +4,7 @@ use std::thread;
 use std::{error::Error, sync::Arc};
 // use std::thread;
 use std::time::{Duration, Instant};
-use rppal::gpio::{Event, Gpio, InputPin, Trigger};
+use rppal::gpio::{Event, Gpio, Trigger};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex;
 use tokio::runtime::Handle;

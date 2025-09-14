@@ -2,6 +2,7 @@
 name = "rasp_party"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
 
 [dependencies]
 rppal = "0.22.1"
